@@ -1,7 +1,6 @@
 fastapi
 uvicorn
 python-multipart
-qdrant-client
 openai
 pypdf
-tiktoken
+qdrant-client==1.7.3
