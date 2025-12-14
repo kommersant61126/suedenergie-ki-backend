@@ -1,6 +1,7 @@
 import os
 import uuid
 from fastapi import FastAPI, UploadFile, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from qdrant_client import QdrantClient
 from qdrant_client.models import VectorParams, Distance
 from openai import OpenAI
@@ -12,13 +13,24 @@ import pypdf
 app = FastAPI(title="Suedenergie KI Backend")
 
 # ==================================================
+# CORS (WICHTIG FÜR WEBAPP)
+# ==================================================
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # später auf Vercel-Domain einschränken
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ==================================================
 # OPENAI
 # ==================================================
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY not set")
 
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
+openai = OpenAI(api_key=OPENAI_API_KEY)
 
 # ==================================================
 # QDRANT
@@ -40,9 +52,8 @@ EMBEDDING_SIZE = 1536  # text-embedding-3-small
 # ==================================================
 # ENSURE COLLECTION EXISTS
 # ==================================================
-existing_collections = [c.name for c in qdrant.get_collections().collections]
-
-if COLLECTION_NAME not in existing_collections:
+collections = qdrant.get_collections().collections
+if COLLECTION_NAME not in [c.name for c in collections]:
     qdrant.create_collection(
         collection_name=COLLECTION_NAME,
         vectors_config=VectorParams(
@@ -55,7 +66,7 @@ if COLLECTION_NAME not in existing_collections:
 # EMBEDDING HELPER
 # ==================================================
 def embed_text(text: str):
-    embedding = openai_client.embeddings.create(
+    embedding = openai.embeddings.create(
         model="text-embedding-3-small",
         input=text
     )
@@ -69,7 +80,7 @@ async def ingest_doc(file: UploadFile):
     try:
         reader = pypdf.PdfReader(file.file)
     except Exception:
-        raise HTTPException(status_code=400, detail="Invalid PDF file")
+        raise HTTPException(status_code=400, detail="Invalid PDF")
 
     points = []
 
@@ -122,7 +133,7 @@ async def chat(query: str):
             hit.payload["text"] for hit in hits
         )
 
-        response = openai_client.responses.create(
+        response = openai.responses.create(
             model="gpt-4.1-mini",
             input=[
                 {
