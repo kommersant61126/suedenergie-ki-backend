@@ -1,75 +1,140 @@
 import os
-from fastapi import FastAPI, UploadFile
+import uuid
+from fastapi import FastAPI, UploadFile, HTTPException
 from qdrant_client import QdrantClient
 from openai import OpenAI
-import uuid
 import pypdf
 
-app = FastAPI()
+# =========================
+# APP
+# =========================
+app = FastAPI(title="Suedenergie KI Backend")
 
-client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+# =========================
+# OPENAI
+# =========================
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY not set")
+
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+# =========================
+# QDRANT
+# =========================
+QDRANT_URL = os.getenv("QDRANT_URL")
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
+
+if not QDRANT_URL or not QDRANT_API_KEY:
+    raise RuntimeError("QDRANT_URL or QDRANT_API_KEY not set")
 
 qdrant = QdrantClient(
-    url=os.environ["QDRANT_URL"],
-    api_key=os.environ["QDRANT_API_KEY"]
+    url=QDRANT_URL,
+    api_key=QDRANT_API_KEY
 )
 
 COLLECTION_NAME = "suedenergie_docs"
 
-def embed(text):
-    res = client.embeddings.create(
+# =========================
+# HELPER: EMBEDDINGS
+# =========================
+def embed_text(text: str):
+    embedding = client.embeddings.create(
         model="text-embedding-3-small",
         input=text
     )
-    return res.data[0].embedding
+    return embedding.data[0].embedding
 
 
+# =========================
+# INGEST DOCUMENT
+# =========================
 @app.post("/ingest")
 async def ingest_doc(file: UploadFile):
-    reader = pypdf.PdfReader(file.file)
+    try:
+        reader = pypdf.PdfReader(file.file)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid PDF file")
+
+    points = []
+
     for page in reader.pages:
         text = page.extract_text()
-        if not text:
+        if not text or not text.strip():
             continue
 
-        vector = embed(text)
+        vector = embed_text(text)
 
-        qdrant.points.upsert(
-            collection_name=COLLECTION_NAME,
-            points=[{
-                "id": str(uuid.uuid4()),
-                "vector": vector,
-                "payload": {"text": text}
-            }]
-        )
+        points.append({
+            "id": str(uuid.uuid4()),
+            "vector": vector,
+            "payload": {
+                "text": text,
+                "source": file.filename
+            }
+        })
 
-    return {"status": "success"}
+    if not points:
+        raise HTTPException(status_code=400, detail="No readable text found in PDF")
+
+    qdrant.points.upsert(
+        collection_name=COLLECTION_NAME,
+        points=points
+    )
+
+    return {
+        "status": "success",
+        "pages_indexed": len(points),
+        "file": file.filename
+    }
 
 
+# =========================
+# CHAT (RAG)
+# =========================
 @app.post("/chat")
 async def chat(query: str):
-    query_vector = embed(query)
+    if not query or not query.strip():
+        raise HTTPException(status_code=400, detail="Query is empty")
 
-    search = qdrant.points.search(
-        collection_name=COLLECTION_NAME,
-        query_vector=query_vector,
-        limit=5
-    )
+    try:
+        query_vector = embed_text(query)
 
-    context = "\n\n---\n\n".join([hit.payload["text"] for hit in search])
+        search_result = qdrant.points.search(
+            collection_name=COLLECTION_NAME,
+            query_vector=query_vector,
+            limit=5
+        )
 
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {
-                "role": "system",
-                "content": "Du bist die interne KI der Südenergie Photovoltaik GmbH. Antworte professionell und nutze das Firmenwissen."
-            },
-            {
-                "role": "user",
-                "content": f"Frage: {query}\n\nFirmenwissen:\n{context}"
-            }
-        ]
-    )
+        context = "\n\n---\n\n".join(
+            [hit.payload["text"] for hit in search_result]
+        )
 
-    return {"answer": response.choices[0].message["content"]}
+        response = client.responses.create(
+            model="gpt-4.1-mini",
+            input=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Du bist die interne KI der Südenergie Photovoltaik GmbH. "
+                        "Antworte professionell, sachlich und auf Deutsch. "
+                        "Nutze vorrangig das bereitgestellte Firmenwissen. "
+                        "Wenn Informationen fehlen, sage das klar."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": f"Frage:\n{query}\n\nFirmenwissen:\n{context}"
+                }
+            ]
+        )
+
+        return {
+            "answer": response.output_text
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Internal error: {str(e)}"
+        )
