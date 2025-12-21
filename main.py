@@ -1,20 +1,39 @@
 import os
 import uuid
-from fastapi import FastAPI, UploadFile, HTTPException
+from typing import List
+
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
 from qdrant_client import QdrantClient
-from qdrant_client.models import VectorParams, Distance
+from qdrant_client.models import PointStruct, VectorParams, Distance
+
+from apscheduler.schedulers.background import BackgroundScheduler
+
 from openai import OpenAI
-import pypdf
+
+# ==================================================
+# ENV
+# ==================================================
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+QDRANT_URL = os.getenv("QDRANT_URL")
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
+
+GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
+GOOGLE_APPLICATION_CREDENTIALS = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
 
 # ==================================================
 # APP
 # ==================================================
-app = FastAPI(title="Suedenergie KI Backend")
 
-# ==================================================
-# CORS (WICHTIG FÜR WEBAPP)
-# ==================================================
+app = FastAPI(
+    title="Suedenergie KI Backend",
+    description="Interne Wissens-KI für Südenergie Photovoltaik GmbH",
+    version="1.0.0",
+)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # später auf Vercel-Domain einschränken
@@ -24,140 +43,141 @@ app.add_middleware(
 )
 
 # ==================================================
-# OPENAI
+# OPENAI (optional lokal)
 # ==================================================
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY not set")
 
-openai = OpenAI(api_key=OPENAI_API_KEY)
+openai_client = None
+if OPENAI_API_KEY:
+    openai_client = OpenAI(api_key=OPENAI_API_KEY)
+else:
+    print("⚠️ OPENAI_API_KEY fehlt – Chat läuft im Fallback-Modus")
 
 # ==================================================
 # QDRANT
 # ==================================================
-QDRANT_URL = os.getenv("QDRANT_URL")
-QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 
 if not QDRANT_URL or not QDRANT_API_KEY:
-    raise RuntimeError("QDRANT_URL or QDRANT_API_KEY not set")
+    raise RuntimeError("QDRANT_URL oder QDRANT_API_KEY fehlt")
 
 qdrant = QdrantClient(
     url=QDRANT_URL,
-    api_key=QDRANT_API_KEY
+    api_key=QDRANT_API_KEY,
 )
 
-COLLECTION_NAME = "suedenergie_docs"
-EMBEDDING_SIZE = 1536  # text-embedding-3-small
+COLLECTION_NAME = "suedenergie_firmenwissen"
+VECTOR_SIZE = 1536
 
-# ==================================================
-# ENSURE COLLECTION EXISTS
-# ==================================================
-collections = qdrant.get_collections().collections
-if COLLECTION_NAME not in [c.name for c in collections]:
+if COLLECTION_NAME not in [c.name for c in qdrant.get_collections().collections]:
     qdrant.create_collection(
         collection_name=COLLECTION_NAME,
         vectors_config=VectorParams(
-            size=EMBEDDING_SIZE,
-            distance=Distance.COSINE
-        )
+            size=VECTOR_SIZE,
+            distance=Distance.COSINE,
+        ),
     )
 
 # ==================================================
-# EMBEDDING HELPER
+# MODELS
 # ==================================================
-def embed_text(text: str):
-    embedding = openai.embeddings.create(
+
+class ChatRequest(BaseModel):
+    query: str
+
+class ChatResponse(BaseModel):
+    answer: str
+
+# ==================================================
+# EMBEDDING
+# ==================================================
+
+def embed_text(text: str) -> List[float]:
+    if not openai_client:
+        return [0.0] * VECTOR_SIZE
+
+    emb = openai_client.embeddings.create(
         model="text-embedding-3-small",
-        input=text
+        input=text,
     )
-    return embedding.data[0].embedding
+    return emb.data[0].embedding
 
 # ==================================================
-# INGEST PDF
+# ROUTES
 # ==================================================
-@app.post("/ingest")
-async def ingest_doc(file: UploadFile):
-    try:
-        reader = pypdf.PdfReader(file.file)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid PDF")
 
-    points = []
-
-    for page in reader.pages:
-        text = page.extract_text()
-        if not text or not text.strip():
-            continue
-
-        points.append({
-            "id": str(uuid.uuid4()),
-            "vector": embed_text(text),
-            "payload": {
-                "text": text,
-                "source": file.filename
-            }
-        })
-
-    if not points:
-        raise HTTPException(status_code=400, detail="No readable text found")
-
-    qdrant.upsert(
-        collection_name=COLLECTION_NAME,
-        points=points
-    )
-
+@app.get("/")
+def root():
     return {
-        "status": "success",
-        "chunks_indexed": len(points),
-        "file": file.filename
+        "status": "ok",
+        "service": "Suedenergie KI Backend",
     }
 
+@app.post("/chat", response_model=ChatResponse)
+def chat(req: ChatRequest):
+    if not req.query.strip():
+        raise HTTPException(status_code=400, detail="Query ist leer")
+
+    query_vector = embed_text(req.query)
+
+    hits = qdrant.search(
+        collection_name=COLLECTION_NAME,
+        query_vector=query_vector,
+        limit=5,
+    )
+
+    context = "\n\n---\n\n".join(
+        hit.payload.get("text", "") for hit in hits
+    )
+
+    if not openai_client:
+        return ChatResponse(
+            answer="⚠️ KI ist noch nicht aktiv konfiguriert (OPENAI_API_KEY fehlt)."
+        )
+
+    response = openai_client.responses.create(
+        model="gpt-4.1-mini",
+        input=[
+            {
+                "role": "system",
+                "content": (
+                    "Du bist die interne KI der Südenergie Photovoltaik GmbH. "
+                    "Antworte professionell, sachlich und auf Deutsch. "
+                    "Nutze primär das Firmenwissen. "
+                    "Wenn etwas nicht bekannt ist, sage das klar."
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"Frage:\n{req.query}\n\nFirmenwissen:\n{context}",
+            },
+        ],
+    )
+
+    return ChatResponse(answer=response.output_text)
+
 # ==================================================
-# CHAT (RAG)
+# GOOGLE DRIVE AUTO SYNC (STUB)
 # ==================================================
-@app.post("/chat")
-async def chat(query: str):
-    if not query or not query.strip():
-        raise HTTPException(status_code=400, detail="Query is empty")
 
-    try:
-        query_vector = embed_text(query)
+def drive_sync_job():
+    if not GOOGLE_DRIVE_FOLDER_ID or not GOOGLE_APPLICATION_CREDENTIALS:
+        print("⚠️ Google Drive Sync übersprungen (ENV fehlt)")
+        return
 
-        hits = qdrant.search(
-            collection_name=COLLECTION_NAME,
-            query_vector=query_vector,
-            limit=5
-        )
+    print("🔄 Google Drive Auto-Sync läuft")
+    # 👉 Hier kommt als Nächstes:
+    # - Dateien listen
+    # - PDFs / Docs lesen
+    # - Embeddings erzeugen
+    # - Qdrant upsert
 
-        context = "\n\n---\n\n".join(
-            hit.payload["text"] for hit in hits
-        )
+# ==================================================
+# SCHEDULER
+# ==================================================
 
-        response = openai.responses.create(
-            model="gpt-4.1-mini",
-            input=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Du bist die interne KI der Südenergie Photovoltaik GmbH. "
-                        "Antworte professionell, sachlich und auf Deutsch. "
-                        "Nutze vorrangig das bereitgestellte Firmenwissen. "
-                        "Wenn Informationen fehlen, sage das klar."
-                    )
-                },
-                {
-                    "role": "user",
-                    "content": f"Frage:\n{query}\n\nFirmenwissen:\n{context}"
-                }
-            ]
-        )
+scheduler = BackgroundScheduler()
+scheduler.add_job(drive_sync_job, "interval", minutes=10)
+scheduler.start()
 
-        return {
-            "answer": response.output_text
-        }
-
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Internal error: {str(e)}"
-        )
+@app.on_event("shutdown")
+def shutdown_event():
+    scheduler.shutdown()

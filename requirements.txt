@@ -1,6 +1,6 @@
 fastapi
 uvicorn
-python-multipart
 openai
-pypdf
-qdrant-client==1.7.3
+qdrant-client
+python-dotenv
+apscheduler
